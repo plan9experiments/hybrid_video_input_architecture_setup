@@ -1,0 +1,203 @@
+#!/bin/rc
+
+rfork e
+
+if(! iseve){
+	if(test -e /srv/fscons){
+		echo 'uname sys +'^$user | con -l /srv/fscons >/dev/null
+		echo 'uname adm +'^$user | con -l /srv/fscons >/dev/null
+		su eve
+	} else {
+		echo 'Error: Run this script from the main server console.' >[1=2]
+		exit 'unprivileged'
+	}
+}
+
+if(test -f /lib/vgadb){
+	if(! aux/vga -ip 1024x768x8 >/dev/null >/dev/null){
+		echo 'Error: 1024x768x8 is missing or invalid in /lib/vgadb.' >[1=2]
+		exit 'invalid_vgamode'
+	}
+} else {
+	echo 'Error: /lib/vgadb is missing.' >[1=2]
+	exit 'missing_vgadb'
+}
+
+echo -n 'Enter network domain: '
+authdom=`{read}
+echo -n 'Enter account user name: '
+authuser=`{read}
+echo -n 'Enter machine secret key: '
+authpass=`{read}
+
+if(test ~ $#authdom 0 || test ~ $#authuser 0 || test ~ $#authpass 0){
+	echo 'Error: Authentication parameters cannot be empty.' >[1=2]
+	exit 'empty_auth'
+}
+
+if(test -e /mnt/factotum/ctl){
+	echo 'key proto=p9sk1 dom='^$authdom^' user='^$authuser^' !password='^$authpass >/mnt/factotum/ctl
+}
+
+touch /sys/log/hybriddisplay
+chmod 662 /sys/log/hybriddisplay
+echo `{date} ^ ' - SYSTEM: Installer initialized.' >>/sys/log/hybriddisplay
+
+9fat:
+if(! test -d /n/9fat){
+	echo 'Error: Unable to mount 9fat.' >[1=2]
+	echo `{date} ^ ' - CRITICAL: Failed to mount 9fat.' >>/sys/log/hybriddisplay
+	exit 'no_9fat'
+}
+
+if(test -f /n/9fat/plan9.ini){
+	cp /n/9fat/plan9.ini /n/9fat/plan9.ini.bak
+	cat << 'EOF' >> /n/9fat/plan9.ini
+bootfile=sdC0!9fat!9pccpu
+service=cpu
+mouseport=ps2
+monitor=vesa
+vgasize=1024x768x8
+EOF
+} else {
+	echo 'Error: plan9.ini missing on 9fat partition.' >[1=2]
+	unmount /n/9fat >/dev/null >/dev/null
+	exit 'missing_ini'
+}
+unmount /n/9fat >/dev/null >/dev/null
+
+cpufile='/cfg/'^$sysname^'/cpurc'
+if(! test -f $cpufile){
+	cpufile='/cfg/cpurc'
+}
+
+if(test -f $cpufile){
+	cat << EOF >> $cpufile
+if(test -e /net/tcp/ctl){
+	echo 'keepalive 10000' >/net/tcp/ctl
+}
+if(test -e /mnt/factotum/ctl){
+	echo 'key proto=p9sk1 dom=$authdom user=$authuser !password=$authpass' >/mnt/factotum/ctl
+}
+EOF
+}
+
+if(test -f /sys/src/9/pc/9pccpu){
+	if(! grep -s '^[ 	]*vga[ 	]*$' /sys/src/9/pc/9pccpu){
+		sed -e '/^dev/a\
+	vga' /sys/src/9/pc/9pccpu > /tmp/9pccpu.tmp && mv /tmp/9pccpu.tmp /sys/src/9/pc/9pccpu
+	}
+} else {
+	echo 'Error: Missing build tree at /sys/src/9/pc/9pccpu' >[1=2]
+	exit 'missing_source'
+}
+
+if(test -f /sys/src/9/pc/mkfile){
+	if(! grep -s 'devvga' /sys/src/9/pc/mkfile){
+		sed -e 's/devarch\.o/devarch.o devvga.o/' /sys/src/9/pc/mkfile > /tmp/mkfile.tmp && mv /tmp/mkfile.tmp /sys/src/9/pc/mkfile
+	}
+} else {
+	echo 'Error: Missing build parameters at /sys/src/9/pc/mkfile' >[1=2]
+	exit 'missing_mkfile'
+}
+
+cd /sys/src/9/pc
+mk '9pccpu'
+if(test -f 9pccpu){
+	cp 9pccpu /9pccpu
+	9fat:
+	cp 9pccpu /n/9fat/9pccpu
+	unmount /n/9fat >/dev/null >/dev/null
+} else {
+	echo 'Error: Kernel compilation failed.' >[1=2]
+	echo `{date} ^ ' - CRITICAL: Kernel compilation failed.' >>/sys/log/hybriddisplay
+	exit 'compile_failure'
+}
+
+cat << 'EOF' > /bin/vgareset
+#!/bin/rc
+rfork e
+
+if(test -e /dev/mouse){
+	unmount /dev/mouse >/dev/null >/dev/null
+	unmount /dev/cons >/dev/null >/dev/null
+}
+if(test -d /mnt/term){
+	unmount /mnt/term >/dev/null >/dev/null
+}
+for(srvfile in /srv/^(*)) {
+	if(test -e $srvfile){
+		if(~ $srvfile *term* || ~ $srvfile *inputs*){
+			rm -f $srvfile
+		}
+	}
+}
+if(test -e /dev/vgactl){
+	echo 'type generic' >/dev/vgactl
+	if(~ $#vgasize 0) vgasize=1024x768x8
+	aux/vga -l $vgasize >/dev/null >/dev/null
+}
+if(test -e /sys/log/hybriddisplay){
+	echo `{date} ^ ' - WARN: Stale connection purged for ' ^ $user >>/sys/log/hybriddisplay
+}
+EOF
+chmod +x /bin/vgareset
+
+cat << 'EOF' > /bin/vgatest
+#!/bin/rc
+echo '=== RUNNING HYBRID ARCHITECTURE TEST SUITE ==='
+if(test -e /dev/vgactl){
+	echo '[PASS] /dev/vgactl is active.'
+} else {
+	echo '[FAIL] /dev/vgactl missing.'
+}
+if(~ $service cpu){
+	if(test -e /mnt/term/dev/mouse){
+		echo '[PASS] Remote inputs located under /mnt/term/dev/.'
+	} else {
+		echo '[FAIL] Remote terminal inputs missing.'
+	}
+}
+if(test -f /lib/vgadb){
+	echo '[PASS] /lib/vgadb verified.'
+} else {
+	echo '[FAIL] /lib/vgadb missing.'
+}
+EOF
+chmod +x /bin/vgatest
+
+userdir='/usr/'^$user^'/lib/profile'
+if(test -f $userdir){
+	cat << 'EOF' >> $userdir
+switch($service){
+case cpu
+	if(test -e /bin/vgareset)
+		/bin/vgareset
+
+	if(test -e /mnt/term/dev/mouse && test -e /dev/vgactl){
+		if(! test -e /dev/draw)
+			bind -b '#i' /dev
+
+		bind /mnt/term/dev/mouse /dev/mouse
+		bind /mnt/term/dev/cons /dev/cons
+
+		if(~ $#vgasize 0) vgasize=1024x768x8
+		if(aux/vga -l $vgasize){
+			if(test -e /sys/log/hybriddisplay)
+				echo `{date} ^ ' - INFO: Configured GPU mode ' ^ $vgasize ^ ' for user ' ^ $user >>/sys/log/hybriddisplay
+		} else {
+			if(test -e /sys/log/hybriddisplay)
+				echo `{date} ^ ' - ERROR: aux/vga failed for mode ' ^ $vgasize >>/sys/log/hybriddisplay
+		}
+
+		exec rio
+	}
+}
+EOF
+}
+
+echo 'Run auth/wrkey to complete NVRAM key configuration.'
+auth/wrkey
+
+echo `{date} ^ ' - SYSTEM: Installation completed.' >>/sys/log/hybriddisplay
+fshalt -r
